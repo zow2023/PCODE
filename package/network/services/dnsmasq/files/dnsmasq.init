@@ -204,8 +204,12 @@ ismounted() {
 	return 1
 }
 
-append_addnhosts() {
+append_extramount() {
 	ismounted "$1" || append EXTRA_MOUNT "$1"
+}
+
+append_addnhosts() {
+	append_extramount "$1"
 	xappend "--addn-hosts=$1"
 }
 
@@ -539,11 +543,22 @@ dhcp_add() {
 	# Override interface netmask with dhcp config if applicable
 	config_get netmask "$cfg" netmask "${subnet##*/}"
 
+	#check for an already active dhcp server on the interface, unless 'force' is set
+	config_get_bool force "$cfg" force 0
+	[ $force -gt 0 ] || dhcp_check "$ifname" || {
+		logger -t dnsmasq \
+			"found already running DHCP-server on interface '$ifname'" \
+			"refusing to start, use 'option force 1' to override"
+		return 0
+	}
+
 	config_get start "$cfg" start 100
 	config_get limit "$cfg" limit 150
 	config_get leasetime "$cfg" leasetime 12h
 	config_get options "$cfg" options
 	config_get_bool dynamicdhcp "$cfg" dynamicdhcp 1
+	config_get_bool dynamicdhcpv4 "$cfg" dynamicdhcpv4 $dynamicdhcp
+	config_get_bool dynamicdhcpv6 "$cfg" dynamicdhcpv6 $dynamicdhcp
 
 	config_get dhcpv4 "$cfg" dhcpv4
 	config_get dhcpv6 "$cfg" dhcpv6
@@ -571,18 +586,17 @@ dhcp_add() {
 		limit=$((limit-1))
 	fi
 
-	eval "$(ipcalc.sh "${subnet%%/*}" $netmask $start $limit)"
+	# make sure the DHCP range is not empty
+	if [ "$dhcpv4" != "disabled" ] && eval "$(ipcalc.sh "${subnet%%/*}" "$netmask" "$start" "$limit")" ; then
+		[ "$dynamicdhcpv4" = "0" ] && END="static"
 
-	if [ "$dynamicdhcp" = "0" ] ; then
-		END="static"
+		xappend "--dhcp-range=$tags$nettag$START,$END,$NETMASK,$leasetime${options:+ $options}"
+	fi
+
+	if [ "$dynamicdhcpv6" = "0" ] ; then
 		dhcp6range="::,static"
 	else
 		dhcp6range="::1000,::ffff"
-	fi
-
-
-	if [ "$dhcpv4" != "disabled" ] ; then
-		xappend "--dhcp-range=$tags$nettag$START,$END,$NETMASK,$leasetime${options:+ $options}"
 	fi
 
 
@@ -795,14 +809,17 @@ dnsmasq_ipset_add() {
 	add_nftset() {
 		local IFS=,
 		for set in $1; do
-			local family=$(echo "$set" | sed -nre 's#^.*[^0-9]([46])$#\1#p')
-			[ -n "$family" ] || \
-				family=$(nft -t list set inet "$table" "$set" 2>&1 | sed -nre 's#^\t\ttype .*\bipv([46])_addr\b.*$#\1#p')
+			local fam="$family"
+			[ -n "$fam" ] || fam=$(echo "$set" | sed -nre \
+				's#^.*[^0-9]([46])$|^.*[-_]([46])[-_].*$|^([46])[^0-9].*$#\1\2\3#p')
+			[ -n "$fam" ] || \
+				fam=$(nft -t list set "$table_family" "$table" "$set" 2>&1 | sed -nre \
+				's#^\t\ttype .*\bipv([46])_addr\b.*$#\1#p')
 
-			[ -n "$family" ] || \
+			[ -n "$fam" ] || \
 				logger -t dnsmasq "Cannot infer address family from non-existent nftables set '$set'"
 
-			nftsets="${nftsets:+$nftsets,}${family:+$family#}inet#$table#$set"
+			nftsets="${nftsets:+$nftsets,}${fam:+$fam#}$table_family#$table#$set"
 		done
 	}
 
@@ -810,7 +827,17 @@ dnsmasq_ipset_add() {
 		# leading '/' is expected
 		domains="$domains/$1"
 	}
+
 	config_get table "$cfg" table 'fw4'
+	config_get table_family "$cfg" table_family 'inet'
+	if [ "$table_family" = "ip" ] ; then
+		family="4"
+	elif [ "$table_family" = "ip6" ] ; then
+		family="6"
+	else
+		config_get family "$cfg" family
+	fi
+
 	config_list_foreach "$cfg" "name" add_ipset
 	config_list_foreach "$cfg" "name" add_nftset
 	config_list_foreach "$cfg" "domain" add_domain
@@ -862,12 +889,6 @@ dnsmasq_start()
 	# if we did this last, we could override auto-generated config
 	[ -f "${dnsmasqconffile}" ] && {
 		xappend "--conf-file=${dnsmasqconffile}"
-	}
-
-	config_get_bool boguspriv "$cfg" boguspriv 1
-	[ "$boguspriv" -gt 0 ] && {
-		xappend "--bogus-priv"
-		[ -r "$RFC6761FILE" ] && xappend "--conf-file=$RFC6761FILE"
 	}
 
 	$PROG --version | grep -osqE "^Compile time options:.* DHCPv6( |$)" && DHCPv6CAPABLE=1 || DHCPv6CAPABLE=0
@@ -944,12 +965,10 @@ dnsmasq_start()
 	append_bool "$cfg" rapidcommit "--dhcp-rapid-commit"
 	append_bool "$cfg" scriptarp "--script-arp"
 
-	append_bool "$cfg" filter_aaaa "--filter-aaaa"
+	append_bool "$cfg" filter_aaaa "--filter-AAAA"
+	append_bool "$cfg" filter_a "--filter-A"
 
 	append_parm "$cfg" logfacility "--log-facility"
-
-	append_parm "$cfg" mini_ttl "--min-ttl"
-
 	config_get logfacility "$cfg" "logfacility"
 	append_parm "$cfg" cachesize "--cache-size"
 	append_parm "$cfg" dnsforwardmax "--dns-forward-max"
@@ -982,8 +1001,8 @@ dnsmasq_start()
 		xappend "--addn-hosts=$HOSTFILE"
 		append EXTRA_MOUNT "$HOSTFILE"
 	else
-		xappend "--addn-hosts=$(dirname $HOSTFILE)"
-		append EXTRA_MOUNT "$(dirname $HOSTFILE)"
+		xappend "--addn-hosts=$HOSTFILE_DIR"
+		append EXTRA_MOUNT "$HOSTFILE_DIR"
 	fi
 	config_list_foreach "$cfg" "addnhosts" append_addnhosts
 	config_list_foreach "$cfg" "bogusnxdomain" append_bogusnxdomain
@@ -1087,6 +1106,7 @@ dnsmasq_start()
 
 	xappend "--dhcp-broadcast=tag:needs-broadcast"
 
+
 	config_get dnsmasqconfdir "$cfg" confdir "/tmp/dnsmasq.d"
 	xappend "--conf-dir=$dnsmasqconfdir"
 	dnsmasqconfdir="${dnsmasqconfdir%%,*}"
@@ -1128,6 +1148,11 @@ dnsmasq_start()
 	config_foreach filter_dnsmasq mxhost dhcp_mx_add "$cfg"
 	echo >> $CONFIGFILE_TMP
 
+	config_get_bool boguspriv "$cfg" boguspriv 1
+	[ "$boguspriv" -gt 0 ] && {
+		xappend "--bogus-priv"
+		[ -r "$RFC6761FILE" ] && xappend "--conf-file=$RFC6761FILE"
+	}
 
 	if [ "$DNSMASQ_DHCP_VER" -gt 4 ] ; then
 		# Enable RA feature for when/if it is constructed,
@@ -1151,7 +1176,6 @@ dnsmasq_start()
 	config_foreach filter_dnsmasq ipset dnsmasq_ipset_add "$cfg"
 	echo >> $CONFIGFILE_TMP
 
-	echo >> $CONFIGFILE_TMP
 	mv -f $CONFIGFILE_TMP $CONFIGFILE
 	mv -f $HOSTFILE_TMP $HOSTFILE
 
@@ -1166,6 +1190,8 @@ dnsmasq_start()
 			echo "nameserver $DNS_SERVER" >> /tmp/resolv.conf
 		done
 	}
+
+	config_list_foreach "$cfg" addnmount append_extramount
 
 	procd_open_instance $cfg
 	procd_set_param command $PROG -C $CONFIGFILE -k -x /var/run/dnsmasq/dnsmasq."${cfg}".pid
@@ -1188,22 +1214,9 @@ dnsmasq_start()
 		[ ! -e "$logfacility" ] && touch "$logfacility"
 		procd_add_jail_mount_rw "$logfacility"
 	esac
+	[ -e "$hostsfile" ] && procd_add_jail_mount $hostsfile
 
 	procd_close_instance
-
-	config_get_bool dns_redirect "$cfg" dns_redirect 0
-	config_get dns_port "$cfg" port 53
-	if [ "$dns_redirect" = 1 ]; then
-		cat <<-EOF > /tmp/dnsmasq-dns-redirect.nft
-			table inet dnsmasq {
-				chain prerouting {
-					type nat hook prerouting priority -105; policy accept;
-					meta nfproto {ipv4, ipv6} udp dport 53 counter redirect to :$dns_port comment "DNSMASQ";
-				}
-			}
-		EOF
-		nft -f /tmp/dnsmasq-dns-redirect.nft
-	fi
 }
 
 dnsmasq_stop()
@@ -1219,15 +1232,6 @@ dnsmasq_stop()
 	[ "$localuse" -gt 0 ] && ln -sf "/tmp/resolv.conf.d/resolv.conf.auto" /tmp/resolv.conf
 
 	rm -f ${BASEDHCPSTAMPFILE}.${cfg}.*.dhcp
-}
-
-nftables_clear()
-{
-	nft --check list table inet dnsmasq > /dev/null 2>&1
-	if [ $? -eq "0" ]; then
-		echo "Remove dnsmasq nat table"
-		nft delete table inet dnsmasq
-	fi
 }
 
 add_interface_trigger()
@@ -1300,7 +1304,6 @@ start_service() {
 }
 
 reload_service() {
-	nftables_clear
 	rc_procd start_service "$@"
 	procd_send_signal dnsmasq "$@"
 }
@@ -1327,5 +1330,4 @@ stop_service() {
 	else
 		config_foreach dnsmasq_stop dnsmasq
 	fi
-	nftables_clear
 }
